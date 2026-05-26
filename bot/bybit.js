@@ -114,15 +114,21 @@ function getExchange() {
       apiKey: process.env.BYBIT_API_KEY,
       secret: process.env.BYBIT_SECRET,
       options: {
-        defaultType: 'swap',       // USDT-маржинальные perpetual (фьючерсы)
+        defaultType: 'swap',
         recvWindow: 5000,
-        // Загружать только нужные рынки — быстрее и надёжнее
-        fetchCurrencies: false,    // не загружать список монет (медленно на testnet)
-        categories: ['linear'],    // только USDT-perpetual
+        fetchCurrencies: false,
+        categories: ['linear'],
       },
-      sandbox: !isLive,            // true = testnet, false = production
+      sandbox: !isLive,
       timeout: 20000,
     });
+
+    // Патч: заставляем CCXT грузить ТОЛЬКО linear рынки.
+    // Без патча CCXT при loadMarkets() запрашивает category=spot,
+    // который заблокирован CloudFront на Railway US-West IP.
+    const origFetch = exchange.fetchMarkets.bind(exchange);
+    exchange.fetchMarkets = (params = {}) => origFetch({ category: 'linear', ...params });
+
     console.log(`[Bybit] Режим: ${isLive ? '🔴 РЕАЛЬНЫЙ' : '🟡 TESTNET'}`);
   }
   return exchange;

@@ -51,8 +51,13 @@ async function scanSymbol(symbol) {
       return log;
     }
 
-    // Проверяем открытые позиции по этому символу
-    const positions   = await getPositions();
+    // Проверяем открытые позиции (fail-safe: если API недоступно — считаем нет позиций)
+    let positions = [];
+    try {
+      positions = await getPositions();
+    } catch (e) {
+      console.log(`[Scanner] ⚠️  getPositions недоступен: ${e.message.slice(0, 60)}`);
+    }
     const hasPosition = positions.some(p => p.symbol === symbol);
     state.openPosition = hasPosition;
 
@@ -85,29 +90,35 @@ async function scanSymbol(symbol) {
       return log;
     }
 
-    // Открываем позицию
+    // Открываем позицию (fail-safe: если API недоступно — логируем сигнал без ордера)
     const side = signal.action === 'long' ? 'buy' : 'sell';
     console.log(`[Scanner] 🚨 СИГНАЛ ${signal.action.toUpperCase()} ${symbol} | ${signal.pattern} | SL:${signal.sl?.toFixed(5)} TP:${signal.tp?.toFixed(5)}`);
 
-    const result = await openPosition({ symbol, side, sl: signal.sl, tp: signal.tp });
-    tradeCounter++;
+    let result = null;
+    try {
+      result = await openPosition({ symbol, side, sl: signal.sl, tp: signal.tp });
+      tradeCounter++;
+      console.log(`[Scanner] ✅ Открыто #${tradeCounter}: ${result.amount} @ ${result.price}`);
+    } catch (e) {
+      console.log(`[Scanner] ⚠️  Торговый API недоступен (${e.message.slice(0, 60)}) — сигнал залогирован без ордера`);
+      log.opened = { action: signal.action, pattern: signal.pattern, price: signal.price, dryRun: true };
+    }
 
-    console.log(`[Scanner] ✅ Открыто #${tradeCounter}: ${result.amount} @ ${result.price}`);
-
-    // Логируем в Notion
-    const pageId = await logTradeOpen({
-      symbol,
-      action:   signal.action,
-      price:    result.price,
-      sl:       signal.sl,
-      tp:       signal.tp,
-      amount:   result.amount,
-      tradeNum: tradeCounter,
-      pattern:  signal.pattern,
-    });
-    if (pageId) notionPages[symbol] = pageId;
-
-    log.opened = { action: signal.action, pattern: signal.pattern, price: result.price };
+    if (result) {
+      // Логируем в Notion
+      const pageId = await logTradeOpen({
+        symbol,
+        action:   signal.action,
+        price:    result.price,
+        sl:       signal.sl,
+        tp:       signal.tp,
+        amount:   result.amount,
+        tradeNum: tradeCounter,
+        pattern:  signal.pattern,
+      });
+      if (pageId) notionPages[symbol] = pageId;
+      log.opened = { action: signal.action, pattern: signal.pattern, price: result.price };
+    }
 
   } catch (err) {
     log.error = err.message;
