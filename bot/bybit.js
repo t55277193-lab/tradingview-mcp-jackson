@@ -25,12 +25,21 @@ let exchange = null;
  * Binance Futures доступен с Railway US-West IP без блокировок.
  */
 export async function fetchPublicOHLCV(symbol, interval = '15', limit = 110) {
+  // Bybit → Binance → Gate.io (каждый следующий — фолбэк)
   try {
     return await _fetchBybitKlines(symbol, interval, limit);
   } catch (e) {
-    console.log(`[OHLCV] Bybit недоступен (${e.message.slice(0, 60)}), переключаюсь на Binance...`);
-    return await _fetchBinanceKlines(symbol, interval, limit);
+    console.log(`[OHLCV] Bybit: ${e.message.slice(0, 80)}`);
   }
+  try {
+    const r = await _fetchBinanceKlines(symbol, interval, limit);
+    console.log(`[OHLCV] Binance ✅`);
+    return r;
+  } catch (e) {
+    console.log(`[OHLCV] Binance: ${e.message.slice(0, 80)}`);
+  }
+  console.log(`[OHLCV] Gate.io fallback...`);
+  return await _fetchGateKlines(symbol, interval, limit);
 }
 
 /** Bybit Futures kline — прямой HTTP без CCXT */
@@ -49,18 +58,38 @@ function _fetchBybitKlines(symbol, interval, limit) {
   });
 }
 
-/** Binance USDM Futures kline — фолбэк */
+/** Binance USDM Futures kline — фолбэк #1 */
 function _fetchBinanceKlines(symbol, interval, limit) {
   // SOL/USDT:USDT → SOLUSDT, 15 → 15m
   const sym  = symbol.replace('/', '').replace(':USDT', '');
   const path = `/fapi/v1/klines?symbol=${sym}&interval=${interval}m&limit=${limit}`;
   return _httpsGet('fapi.binance.com', path).then(raw => {
     const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) throw new Error(`Binance: unexpected response`);
+    if (!Array.isArray(arr)) throw new Error(`Binance blocked: ${raw.slice(0, 120)}`);
     // Binance: [openTime, open, high, low, close, volume, ...]
     return arr.map(([t, o, h, l, c, v]) => ({
       time: parseInt(t), open: parseFloat(o), high: parseFloat(h),
       low:  parseFloat(l), close: parseFloat(c), volume: parseFloat(v),
+    }));
+  });
+}
+
+/** Gate.io USDT Futures kline — фолбэк #2 (нет US блокировок) */
+function _fetchGateKlines(symbol, interval, limit) {
+  // SOL/USDT:USDT → SOL_USDT, 15 → 15m
+  const sym  = symbol.split('/')[0] + '_USDT';
+  const path = `/api/v4/futures/usdt/candlesticks?contract=${sym}&interval=${interval}m&limit=${limit}`;
+  return _httpsGet('api.gateio.ws', path).then(raw => {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) throw new Error(`Gate.io: ${raw.slice(0, 120)}`);
+    // Gate.io: [{t, o, h, l, c, v, sum}, ...] — от старых к новым
+    return arr.map(bar => ({
+      time:   parseInt(bar.t) * 1000,  // Gate.io в секундах → мс
+      open:   parseFloat(bar.o),
+      high:   parseFloat(bar.h),
+      low:    parseFloat(bar.l),
+      close:  parseFloat(bar.c),
+      volume: parseFloat(bar.v),
     }));
   });
 }
