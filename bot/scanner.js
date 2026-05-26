@@ -9,9 +9,8 @@
  */
 
 import { analyzeCandles, inKillZone } from './signals.js';
-import { openPosition, getPositions }  from './bybit.js';
+import { openPosition, getPositions, fetchPublicOHLCV } from './bybit.js';
 import { logTradeOpen }                from './notion.js';
-import { getExchangePublic }           from './bybit.js';
 
 // ══════════ Символы для торговли ══════════
 const SYMBOLS = [
@@ -32,23 +31,21 @@ function getState(symbol) {
   return symbolStates[symbol];
 }
 
-// ══════════ Загрузка свечей с Bybit ══════════
-async function fetchClosedCandles(exchange, symbol, limit = 110) {
-  const ohlcv = await exchange.fetchOHLCV(symbol, '15m', undefined, limit);
+// ══════════ Загрузка свечей с Bybit (прямой HTTP) ══════════
+async function fetchClosedCandles(symbol, limit = 110) {
+  const candles = await fetchPublicOHLCV(symbol, '15', limit);
   // Убираем последнюю свечу — она ещё не закрыта
-  return ohlcv.slice(0, -1).map(([time, open, high, low, close, volume]) => ({
-    time, open, high, low, close, volume,
-  }));
+  return candles.slice(0, -1);
 }
 
 // ══════════ Сканирование одного символа ══════════
-async function scanSymbol(exchange, symbol) {
+async function scanSymbol(symbol) {
   const state = getState(symbol);
   const log   = { symbol, ts: new Date().toISOString(), signal: null, reason: null, error: null };
 
   try {
-    // Загружаем свечи
-    const candles = await fetchClosedCandles(exchange, symbol);
+    // Загружаем свечи напрямую через HTTP (без CCXT, без loadMarkets)
+    const candles = await fetchClosedCandles(symbol);
     if (candles.length < 60) {
       log.reason = `мало свечей: ${candles.length}`;
       return log;
@@ -122,13 +119,12 @@ async function scanSymbol(exchange, symbol) {
 
 // ══════════ Один цикл сканирования ══════════
 async function runScanCycle() {
-  const exchange = getExchangePublic();
   const ts = new Date().toISOString();
   console.log(`\n[Scanner] ━━━ Цикл ${ts} ━━━`);
 
   const results = [];
   for (const symbol of SYMBOLS) {
-    const r = await scanSymbol(exchange, symbol);
+    const r = await scanSymbol(symbol);
     results.push(r);
     // Небольшая пауза между запросами чтобы не бить rate limit
     await new Promise(res => setTimeout(res, 800));

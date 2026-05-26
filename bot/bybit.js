@@ -1,4 +1,5 @@
 import ccxt from 'ccxt';
+import https from 'https';
 
 /**
  * Bybit Futures клиент
@@ -6,20 +7,47 @@ import ccxt from 'ccxt';
  */
 
 let exchange = null;
-let publicExchange = null;
 
 /**
- * Публичный exchange для загрузки OHLCV (без аутентификации)
- * Используется сканером — не требует API ключей
+ * Прямой HTTP-запрос к Bybit v5 публичному API (без CCXT).
+ * CCXT при инициализации загружает спотовые рынки (category=spot),
+ * которые заблокированы CloudFront на некоторых Railway IP.
+ * Этот метод минует loadMarkets() и идёт напрямую на kline endpoint.
+ *
+ * @param {string} symbol  - ccxt формат: 'SOL/USDT:USDT'
+ * @param {string} interval - '1','5','15','60','240','D'
+ * @param {number} limit   - кол-во свечей (макс 200)
+ * @returns {Promise<Array>} массив { time, open, high, low, close, volume }
  */
-export function getExchangePublic() {
-  if (!publicExchange) {
-    publicExchange = new ccxt.bybit({
-      options: { defaultType: 'swap', fetchCurrencies: false, categories: ['linear'] },
-      timeout: 20000,
+export function fetchPublicOHLCV(symbol, interval = '15', limit = 110) {
+  // SOL/USDT:USDT → SOLUSDT
+  const bybitSymbol = symbol.replace('/', '').replace(':USDT', '');
+  const path = `/v5/market/kline?category=linear&symbol=${bybitSymbol}&interval=${interval}&limit=${limit}`;
+
+  return new Promise((resolve, reject) => {
+    const req = https.get({ hostname: 'api.bybit.com', path, timeout: 20000 }, (res) => {
+      let raw = '';
+      res.on('data', chunk => raw += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(raw);
+          if (json.retCode !== 0) throw new Error(`Bybit kline: ${json.retMsg}`);
+          // Bybit возвращает свечи от новых к старым — реверсируем
+          const candles = json.result.list.reverse().map(([t, o, h, l, c, v]) => ({
+            time:   parseInt(t),
+            open:   parseFloat(o),
+            high:   parseFloat(h),
+            low:    parseFloat(l),
+            close:  parseFloat(c),
+            volume: parseFloat(v),
+          }));
+          resolve(candles);
+        } catch (e) { reject(e); }
+      });
     });
-  }
-  return publicExchange;
+    req.on('timeout', () => { req.destroy(); reject(new Error('Bybit kline timeout')); });
+    req.on('error', reject);
+  });
 }
 
 function getExchange() {
