@@ -1,0 +1,254 @@
+//@version=6
+strategy("SMC v5 — OB+LiqSwipe | KZ+ADX+ST+EMA+Vol", overlay=true,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+         initial_capital=1000, commission_type=strategy.commission.percent,
+         commission_value=0.05, pyramiding=2)
+
+// ══════════ INPUTS ══════════
+bosLen   = input.int(20,   "BOS lookback (баров)",        group="Сигнал")
+obBuf    = input.float(0.3,"OB буфер SL %",               group="Управление риском")
+rrRatio  = input.float(3.0,"RR (финальный тейк)",          group="Управление риском")
+swipeTol = input.float(0.3,"Swing tolerance % (LiqSwipe)", group="Сигнал")
+
+// ══ ЧАСТИЧНЫЕ ТЕЙКИ (A+ улучшение) ══
+usePartialTPs = input.bool(false, "Частичные тейки (TP1/TP2/TP3)", group="Управление риском")
+tp1R          = input.float(1.0,  "TP1 на уровне R",               group="Управление риском")
+tp2R          = input.float(2.0,  "TP2 на уровне R",               group="Управление риском")
+useBE         = input.bool(false, "SL → Breakeven после TP1",       group="Управление риском")
+
+adxLen   = input.int(14,   "ADX period",                   group="Фильтры")
+adxMin   = input.int(20,   "ADX минимум",                  group="Фильтры")
+stLen    = input.int(10,   "SuperTrend period",             group="Фильтры")
+stMult   = input.float(3.0,"SuperTrend mult",               group="Фильтры")
+emaLen   = input.int(50,   "HTF EMA (1H bars)",             group="Фильтры")
+volMult  = input.float(1.5,"Volume фильтр (×avg)",          group="Фильтры")
+volAvg   = input.int(20,   "Volume avg period",             group="Фильтры")
+useVolOnEntry = input.bool(false, "Volume фильтр на ВХОДЕ в OB",   group="Фильтры")
+
+// ══════════ KILL ZONES (UTC) ══════════
+hourUTC = hour(time, "UTC")
+inKZ    = (hourUTC >= 7 and hourUTC < 10) or (hourUTC >= 13 and hourUTC < 16)
+
+// ══════════ ADX ══════════
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+trendOK = adxVal > adxMin
+
+// ══════════ SUPERTREND ══════════
+[stLine, stDir] = ta.supertrend(stMult, stLen)
+stBull = stDir < 0
+stBear = stDir > 0
+
+// ══════════ HTF EMA50 (15M — 50 баров ≈ 12.5 часов, хороший фильтр) ══════════
+ema50_1h = ta.ema(close, emaLen)
+aboveEMA = close > ema50_1h
+belowEMA = close < ema50_1h
+
+// ══════════ VOLUME FILTER ══════════
+avgVol  = ta.sma(volume, volAvg)
+volOK   = volume > avgVol * volMult
+
+// ══════════ BOS (структура) ══════════
+prevHigh = ta.highest(high, bosLen)[1]
+prevLow  = ta.lowest(low,   bosLen)[1]
+bosLong  = close > prevHigh   // пробой вверх (BOS Long)
+bosShort = close < prevLow    // пробой вниз  (BOS Short)
+
+// ══════════ ORDER BLOCK (OB) ══════════
+// Бычий OB  = последняя медвежья свеча перед BOS-импульсом вверх
+// Медвежий OB = последняя бычья свеча перед BOS-импульсом вниз
+// Простое определение: свеча [1] противоположная направлению BOS
+
+bullOB_high = high[1]   // верх бычьего OB
+bullOB_low  = low[1]    // низ бычьего OB (open[1] если bearish candle)
+bearOB_high = high[1]
+bearOB_low  = low[1]
+
+// OB-вход: цена вернулась в зону OB (pullback после BOS)
+// Паттерн 1 — LONG: BOS вверх был, ST бычий, цена в bullOB зоне
+var bool pendingLong = false
+var bool pendingShort = false
+var float obLongHigh = na
+var float obLongLow  = na
+var float obShortHigh = na
+var float obShortLow  = na
+var int   obLongBar  = 0
+var int   obShortBar = 0
+var int   maxWaitOB  = 15  // баров ожидания pullback в OB
+
+// Запомнить OB при BOS
+if bosLong and stBull and inKZ and trendOK and aboveEMA and volOK and strategy.position_size == 0
+    pendingLong  := true
+    obLongHigh   := bullOB_high
+    obLongLow    := bullOB_low
+    obLongBar    := bar_index
+
+if bosShort and stBear and inKZ and trendOK and belowEMA and volOK and strategy.position_size == 0
+    pendingShort  := true
+    obShortHigh   := bearOB_high
+    obShortLow    := bearOB_low
+    obShortBar    := bar_index
+
+// Volume на входе в OB (улучшение — проверяем объём при самом откате, не только при BOS)
+volOKEntry = not useVolOnEntry or (volume > avgVol * volMult)
+
+// Вход когда цена откатывается в OB (Паттерн 1)
+longOBEntry  = pendingLong  and low <= obLongHigh  and close >= obLongLow  and bar_index - obLongBar  <= maxWaitOB and strategy.position_size == 0 and volOKEntry
+shortOBEntry = pendingShort and high >= obShortLow and close <= obShortHigh and bar_index - obShortBar <= maxWaitOB and strategy.position_size == 0 and volOKEntry
+
+// Сброс ожидания OB
+if bar_index - obLongBar  > maxWaitOB or strategy.position_size != 0
+    pendingLong := false
+if bar_index - obShortBar > maxWaitOB or strategy.position_size != 0
+    pendingShort := false
+
+// ══════════ ПАТТЕРН 2 — LIQUIDITY SWEEP (двойная/тройная вершина/дно) ══════════
+// Свип: цена пробивает swing high/low, но свеча ЗАКРЫВАЕТСЯ обратно
+// Двойная вершина: два хая примерно на одном уровне (±swipeTol%)
+swing_high_1 = ta.highest(high, bosLen)[1]   // swing high (не включая текущий бар)
+swing_low_1  = ta.lowest(low,   bosLen)[1]
+
+// Свип вверх (медвежий): high > swing_high, но close < swing_high
+bearSweep = high > swing_high_1 and close < swing_high_1 * (1 + swipeTol/100)
+
+// Свип вниз (бычий): low < swing_low, но close > swing_low
+bullSweep = low < swing_low_1 and close > swing_low_1 * (1 - swipeTol/100)
+
+// Паттерн 2 с фильтрами (направление противоположно — разворот)
+longSweep  = bullSweep and stBull and inKZ and trendOK and aboveEMA
+shortSweep = bearSweep and stBear and inKZ and trendOK and belowEMA
+
+// ══════════ ВХОДЫ ══════════
+enableLong  = input.bool(true,  "Лонги включены",  group="Сигнал")
+enableShort = input.bool(true,  "Шорты включены",  group="Сигнал")
+
+// Вебхук секрет (задать в настройках индикатора)
+webhookSecret = input.string("my_secret_token_123", "Webhook secret", group="Бот")
+
+// ══════════ ЧАСТИЧНЫЕ ТЕЙКИ + BE ══════════
+// Отслеживаем цену входа и уровень TP1 для сдвига SL в BE
+var float entryPriceLong  = na
+var float entryPriceShort = na
+var float tp1LevelLong    = na
+var float tp1LevelShort   = na
+var bool  beLong          = false
+var bool  beShort         = false
+
+// Сдвиг SL в BE когда цена достигла TP1
+if useBE and strategy.position_size > 0 and not beLong and not na(tp1LevelLong)
+    if high >= tp1LevelLong
+        strategy.exit("L_BE", stop=entryPriceLong)
+        beLong := true
+
+if useBE and strategy.position_size < 0 and not beShort and not na(tp1LevelShort)
+    if low <= tp1LevelShort
+        strategy.exit("S_BE", stop=entryPriceShort)
+        beShort := true
+
+// Сброс флагов при закрытии позиции
+if strategy.position_size == 0
+    beLong  := false
+    beShort := false
+    tp1LevelLong  := na
+    tp1LevelShort := na
+
+// ══════════ ВХОДЫ ══════════
+
+// Паттерн 1 — OB pullback
+if longOBEntry and enableLong
+    sl     = obLongLow * (1 - obBuf / 100)
+    slDist = close - sl
+    tp     = close + slDist * rrRatio
+    tp1    = close + slDist * tp1R
+    tp2    = close + slDist * tp2R
+    strategy.entry("L_OB", strategy.long)
+    if usePartialTPs
+        strategy.exit("L_OB_TP1",  "L_OB", qty_percent=33, limit=tp1)
+        strategy.exit("L_OB_TP2",  "L_OB", qty_percent=50, limit=tp2)
+        strategy.exit("L_OB_TP3",  "L_OB", qty_percent=100, limit=tp, stop=sl)
+        entryPriceLong := close
+        tp1LevelLong   := tp1
+    else
+        strategy.exit("L_OB_exit", "L_OB", limit=tp, stop=sl)
+    pendingLong := false
+    alert('{"secret":"' + webhookSecret + '","action":"long","symbol":"' + syminfo.ticker + '","price":"' + str.tostring(close, "#.######") + '","sl":"' + str.tostring(sl, "#.######") + '","tp":"' + str.tostring(tp, "#.######") + '","pattern":"OB"}', alert.freq_once_per_bar_close)
+
+if shortOBEntry and enableShort
+    sl     = obShortHigh * (1 + obBuf / 100)
+    slDist = sl - close
+    tp     = close - slDist * rrRatio
+    tp1    = close - slDist * tp1R
+    tp2    = close - slDist * tp2R
+    strategy.entry("S_OB", strategy.short)
+    if usePartialTPs
+        strategy.exit("S_OB_TP1",  "S_OB", qty_percent=33, limit=tp1)
+        strategy.exit("S_OB_TP2",  "S_OB", qty_percent=50, limit=tp2)
+        strategy.exit("S_OB_TP3",  "S_OB", qty_percent=100, limit=tp, stop=sl)
+        entryPriceShort := close
+        tp1LevelShort   := tp1
+    else
+        strategy.exit("S_OB_exit", "S_OB", limit=tp, stop=sl)
+    pendingShort := false
+    alert('{"secret":"' + webhookSecret + '","action":"short","symbol":"' + syminfo.ticker + '","price":"' + str.tostring(close, "#.######") + '","sl":"' + str.tostring(sl, "#.######") + '","tp":"' + str.tostring(tp, "#.######") + '","pattern":"OB"}', alert.freq_once_per_bar_close)
+
+// Паттерн 2 — LiqSwipe
+if longSweep and strategy.position_size == 0 and enableLong
+    sl     = low * (1 - obBuf / 100)
+    slDist = close - sl
+    tp     = close + slDist * rrRatio
+    tp1    = close + slDist * tp1R
+    tp2    = close + slDist * tp2R
+    strategy.entry("L_SW", strategy.long)
+    if usePartialTPs
+        strategy.exit("L_SW_TP1",  "L_SW", qty_percent=33, limit=tp1)
+        strategy.exit("L_SW_TP2",  "L_SW", qty_percent=50, limit=tp2)
+        strategy.exit("L_SW_TP3",  "L_SW", qty_percent=100, limit=tp, stop=sl)
+        entryPriceLong := close
+        tp1LevelLong   := tp1
+    else
+        strategy.exit("L_SW_exit", "L_SW", limit=tp, stop=sl)
+    alert('{"secret":"' + webhookSecret + '","action":"long","symbol":"' + syminfo.ticker + '","price":"' + str.tostring(close, "#.######") + '","sl":"' + str.tostring(sl, "#.######") + '","tp":"' + str.tostring(tp, "#.######") + '","pattern":"Sweep"}', alert.freq_once_per_bar_close)
+
+if shortSweep and strategy.position_size == 0 and enableShort
+    sl     = high * (1 + obBuf / 100)
+    slDist = sl - close
+    tp     = close - slDist * rrRatio
+    tp1    = close - slDist * tp1R
+    tp2    = close - slDist * tp2R
+    strategy.entry("S_SW", strategy.short)
+    if usePartialTPs
+        strategy.exit("S_SW_TP1",  "S_SW", qty_percent=33, limit=tp1)
+        strategy.exit("S_SW_TP2",  "S_SW", qty_percent=50, limit=tp2)
+        strategy.exit("S_SW_TP3",  "S_SW", qty_percent=100, limit=tp, stop=sl)
+        entryPriceShort := close
+        tp1LevelShort   := tp1
+    else
+        strategy.exit("S_SW_exit", "S_SW", limit=tp, stop=sl)
+    alert('{"secret":"' + webhookSecret + '","action":"short","symbol":"' + syminfo.ticker + '","price":"' + str.tostring(close, "#.######") + '","sl":"' + str.tostring(sl, "#.######") + '","tp":"' + str.tostring(tp, "#.######") + '","pattern":"Sweep"}', alert.freq_once_per_bar_close)
+
+// ══════════ ВИЗУАЛ ══════════
+plot(ema50_1h, "EMA50", color.new(color.orange, 60), 1)
+plot(stLine, "ST", stBull ? color.new(color.lime, 50) : color.new(color.red, 50), 1)
+bgcolor(inKZ ? color.new(color.yellow, 93) : na)
+plotshape(longOBEntry,  "L_OB↑", shape.triangleup,   location.belowbar, color.lime, size=size.small)
+plotshape(shortOBEntry, "S_OB↓", shape.triangledown,  location.abovebar, color.red,  size=size.small)
+plotshape(longSweep,  "L_SW↑", shape.circle, location.belowbar, color.new(color.lime, 30), size=size.tiny)
+plotshape(shortSweep, "S_SW↓", shape.circle, location.abovebar, color.new(color.red, 30),  size=size.tiny)
+
+// ══════════ ТАБЛИЦА ══════════
+var table t = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 60), border_color=color.new(color.gray, 50), border_width=1)
+netPnl  = strategy.netprofit
+winRate = strategy.wintrades / math.max(strategy.closedtrades, 1) * 100
+table.cell(t, 0, 0, "SMC v5",         text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.gray, 60))
+table.cell(t, 1, 0, "OB+Sweep 15M",   text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.gray, 60))
+table.cell(t, 0, 1, "Сделок",         text_color=color.gray,   text_size=size.small)
+table.cell(t, 1, 1, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.small)
+table.cell(t, 0, 2, "Win%",           text_color=color.gray,   text_size=size.small)
+table.cell(t, 1, 2, str.tostring(math.round(winRate, 1)) + "%", text_color=winRate > 40 ? color.lime : color.orange, text_size=size.small)
+table.cell(t, 0, 3, "PnL $",          text_color=color.gray,   text_size=size.small)
+table.cell(t, 1, 3, str.tostring(math.round(netPnl, 2)), text_color=netPnl > 0 ? color.lime : color.red, text_size=size.small)
+table.cell(t, 0, 4, "ADX",            text_color=color.gray,   text_size=size.small)
+table.cell(t, 1, 4, str.tostring(math.round(adxVal, 1)), text_color=trendOK ? color.lime : color.orange, text_size=size.small)
+table.cell(t, 0, 5, "ST",             text_color=color.gray,   text_size=size.small)
+table.cell(t, 1, 5, stBull ? "▲ Bull" : "▼ Bear", text_color=stBull ? color.lime : color.red, text_size=size.small)
+table.cell(t, 0, 6, "EMA",            text_color=color.gray,   text_size=size.small)
+table.cell(t, 1, 6, aboveEMA ? "▲ Above" : "▼ Below", text_color=aboveEMA ? color.lime : color.red, text_size=size.small)

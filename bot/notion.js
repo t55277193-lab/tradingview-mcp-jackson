@@ -49,7 +49,30 @@ function notionRequest(method, path, body) {
  * Создать запись о сделке при открытии позиции
  * Возвращает page_id для последующего обновления при закрытии
  */
-export async function logTradeOpen({ symbol, action, price, sl, tp, amount, tradeNum }) {
+// Определить Setup из паттерна
+function detectSetup(pattern, action) {
+  if (pattern === 'OB') return [{ name: 'Continuation' }];
+  if (pattern === 'Sweep') {
+    return action === 'long'
+      ? [{ name: 'M15 double bottom' }]
+      : [{ name: 'M15 double top' }];
+  }
+  return [{ name: 'Continuation' }];
+}
+
+// Определить Контекст для входа из паттерна
+function detectContext(pattern, action) {
+  const base = [{ name: 'M15 BOS' }, { name: 'M15 OF' }];
+  if (pattern === 'Sweep') {
+    base.push(action === 'long' ? { name: 'PDL grab' } : { name: 'PDH grab' });
+  }
+  if (pattern === 'OB') {
+    base.push({ name: 'LTF OF' });
+  }
+  return base;
+}
+
+export async function logTradeOpen({ symbol, action, price, sl, tp, amount, tradeNum, pattern }) {
   if (!NOTION_TOKEN || !NOTION_DB_ID) {
     console.log('[Notion] Токен или DB ID не настроены, пропускаем');
     return null;
@@ -73,13 +96,15 @@ export async function logTradeOpen({ symbol, action, price, sl, tp, amount, trad
       'RR':             { number: 3 },
       'SL %':           { number: parseFloat(slPct.toFixed(2)) },
       'Сделка №':       { number: tradeNum },
-      'Сделка открыта во время KZ?':   { checkbox: session !== 'Out of KZ' },
+      'Setup':          { multi_select: detectSetup(pattern, action) },
+      'Контекст для входа': { multi_select: detectContext(pattern, action) },
+      'Сделка открыта во время KZ?':    { checkbox: session !== 'Out of KZ' },
       'Сделка проверена на бэктестах?': { checkbox: true },
-      'Сделка по тренду HTF?':         { checkbox: true },
+      'Сделка по тренду HTF?':          { checkbox: true },
       'Заметки': {
         rich_text: [{
           text: {
-            content: `Цена входа: ${price} | SL: ${sl?.toFixed?.(4) ?? sl} | TP: ${tp?.toFixed?.(4) ?? tp} | Размер: ${amount}`
+            content: `Цена: ${price} | SL: ${sl?.toFixed?.(4) ?? sl} | TP: ${tp?.toFixed?.(4) ?? tp} | Размер: ${amount} | Pattern: ${pattern ?? 'N/A'}`
           }
         }]
       }

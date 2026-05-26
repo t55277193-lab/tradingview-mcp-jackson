@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import { openPosition, closePosition, getPositions } from './bybit.js';
 import { logTradeOpen, logTradeClose } from './notion.js';
+import { startScanner, getScannerStatus, notionPages as scannerNotionPages } from './scanner.js';
 
 const app = express();
 app.use(express.json());
@@ -157,6 +158,7 @@ app.post('/webhook', checkSecret, async (req, res) => {
       price: result.price, sl, tp,
       amount: result.amount,
       tradeNum: tradeCounter,
+      pattern: body.pattern ?? null,
     });
     if (notionPageId) notionPages[symbol] = notionPageId;
 
@@ -199,19 +201,30 @@ app.get('/status', async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+// GET /scanner — состояние автономного сканера
+// ══════════════════════════════════════════
+app.get('/scanner', (req, res) => {
+  res.json({ ok: true, ...getScannerStatus() });
+});
+
+// ══════════════════════════════════════════
 // GET / — health check
 // ══════════════════════════════════════════
 app.get('/', (req, res) => {
-  res.json({ ok: true, bot: 'SMC Trading Bot', version: '1.0' });
+  res.json({ ok: true, bot: 'SMC Trading Bot', version: '2.0', mode: 'autonomous' });
 });
 
 // ══════════════════════════════════════════
 // Запуск сервера
 // ══════════════════════════════════════════
 app.listen(PORT, () => {
-  console.log(`\n🚀 SMC Trading Bot запущен на порту ${PORT}`);
+  console.log(`\n🚀 SMC Trading Bot v2.0 запущен на порту ${PORT}`);
   console.log(`   Режим: ${process.env.LIVE_TRADING === 'true' ? '🔴 РЕАЛЬНЫЙ' : '🟡 TESTNET/PAPER'}`);
   console.log(`   Webhook: POST http://localhost:${PORT}/webhook`);
   console.log(`   Статус:  GET  http://localhost:${PORT}/status`);
+  console.log(`   Сканер:  GET  http://localhost:${PORT}/scanner`);
   console.log(`   Секрет:  ${WEBHOOK_SECRET ? '✅ настроен' : '⚠️ НЕ ЗАДАН — все запросы будут приниматься'}\n`);
+
+  // Запускаем автономный сканер
+  startScanner();
 });
