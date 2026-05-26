@@ -19,33 +19,61 @@ let exchange = null;
  * @param {number} limit   - кол-во свечей (макс 200)
  * @returns {Promise<Array>} массив { time, open, high, low, close, volume }
  */
-export function fetchPublicOHLCV(symbol, interval = '15', limit = 110) {
-  // SOL/USDT:USDT → SOLUSDT
-  const bybitSymbol = symbol.replace('/', '').replace(':USDT', '');
-  const path = `/v5/market/kline?category=linear&symbol=${bybitSymbol}&interval=${interval}&limit=${limit}`;
+/**
+ * Универсальная загрузка OHLCV: Bybit → фолбэк на Binance Futures
+ * Оба источника публичные, без аутентификации.
+ * Binance Futures доступен с Railway US-West IP без блокировок.
+ */
+export async function fetchPublicOHLCV(symbol, interval = '15', limit = 110) {
+  try {
+    return await _fetchBybitKlines(symbol, interval, limit);
+  } catch (e) {
+    console.log(`[OHLCV] Bybit недоступен (${e.message.slice(0, 60)}), переключаюсь на Binance...`);
+    return await _fetchBinanceKlines(symbol, interval, limit);
+  }
+}
 
+/** Bybit Futures kline — прямой HTTP без CCXT */
+function _fetchBybitKlines(symbol, interval, limit) {
+  // SOL/USDT:USDT → SOLUSDT
+  const sym  = symbol.replace('/', '').replace(':USDT', '');
+  const path = `/v5/market/kline?category=linear&symbol=${sym}&interval=${interval}&limit=${limit}`;
+  return _httpsGet('api.bybit.com', path).then(raw => {
+    const json = JSON.parse(raw);
+    if (json.retCode !== 0) throw new Error(`Bybit: ${json.retMsg}`);
+    // Bybit: от новых к старым → реверс
+    return json.result.list.reverse().map(([t, o, h, l, c, v]) => ({
+      time: parseInt(t), open: parseFloat(o), high: parseFloat(h),
+      low:  parseFloat(l), close: parseFloat(c), volume: parseFloat(v),
+    }));
+  });
+}
+
+/** Binance USDM Futures kline — фолбэк */
+function _fetchBinanceKlines(symbol, interval, limit) {
+  // SOL/USDT:USDT → SOLUSDT, 15 → 15m
+  const sym  = symbol.replace('/', '').replace(':USDT', '');
+  const path = `/fapi/v1/klines?symbol=${sym}&interval=${interval}m&limit=${limit}`;
+  return _httpsGet('fapi.binance.com', path).then(raw => {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) throw new Error(`Binance: unexpected response`);
+    // Binance: [openTime, open, high, low, close, volume, ...]
+    return arr.map(([t, o, h, l, c, v]) => ({
+      time: parseInt(t), open: parseFloat(o), high: parseFloat(h),
+      low:  parseFloat(l), close: parseFloat(c), volume: parseFloat(v),
+    }));
+  });
+}
+
+/** Простой HTTPS GET с таймаутом */
+function _httpsGet(hostname, path) {
   return new Promise((resolve, reject) => {
-    const req = https.get({ hostname: 'api.bybit.com', path, timeout: 20000 }, (res) => {
+    const req = https.get({ hostname, path, timeout: 20000 }, (res) => {
       let raw = '';
       res.on('data', chunk => raw += chunk);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(raw);
-          if (json.retCode !== 0) throw new Error(`Bybit kline: ${json.retMsg}`);
-          // Bybit возвращает свечи от новых к старым — реверсируем
-          const candles = json.result.list.reverse().map(([t, o, h, l, c, v]) => ({
-            time:   parseInt(t),
-            open:   parseFloat(o),
-            high:   parseFloat(h),
-            low:    parseFloat(l),
-            close:  parseFloat(c),
-            volume: parseFloat(v),
-          }));
-          resolve(candles);
-        } catch (e) { reject(e); }
-      });
+      res.on('end', () => resolve(raw));
     });
-    req.on('timeout', () => { req.destroy(); reject(new Error('Bybit kline timeout')); });
+    req.on('timeout', () => { req.destroy(); reject(new Error(`timeout ${hostname}`)); });
     req.on('error', reject);
   });
 }
