@@ -24,22 +24,46 @@ let exchange = null;
  * Оба источника публичные, без аутентификации.
  * Binance Futures доступен с Railway US-West IP без блокировок.
  */
-export async function fetchPublicOHLCV(symbol, interval = '15', limit = 110) {
-  // Bybit → Binance → Gate.io (каждый следующий — фолбэк)
+/**
+ * 15-минутные свечи: Bybit → Binance → Gate.io
+ * interval для каждой биржи:  Bybit='15', Binance='15m', Gate.io='15m'
+ */
+export async function fetchPublicOHLCV(symbol, limit = 110) {
   try {
-    return await _fetchBybitKlines(symbol, interval, limit);
+    return await _fetchBybitKlines(symbol, '15', limit);
   } catch (e) {
     console.log(`[OHLCV] Bybit: ${e.message.slice(0, 80)}`);
   }
   try {
-    const r = await _fetchBinanceKlines(symbol, interval, limit);
+    const r = await _fetchBinanceKlines(symbol, '15m', limit);
     console.log(`[OHLCV] Binance ✅`);
     return r;
   } catch (e) {
     console.log(`[OHLCV] Binance: ${e.message.slice(0, 80)}`);
   }
   console.log(`[OHLCV] Gate.io fallback...`);
-  return await _fetchGateKlines(symbol, interval, limit);
+  return await _fetchGateKlines(symbol, '15m', limit);
+}
+
+/**
+ * Дневные свечи для Markov Regime Model: Bybit → Binance → Gate.io
+ * interval: Bybit='D', Binance='1d', Gate.io='1d'
+ */
+export async function fetchPublicDailyOHLCV(symbol, limit = 220) {
+  try {
+    return await _fetchBybitKlines(symbol, 'D', limit);
+  } catch (e) {
+    console.log(`[OHLCV-D] Bybit: ${e.message.slice(0, 80)}`);
+  }
+  try {
+    const r = await _fetchBinanceKlines(symbol, '1d', limit);
+    console.log(`[OHLCV-D] Binance ✅`);
+    return r;
+  } catch (e) {
+    console.log(`[OHLCV-D] Binance: ${e.message.slice(0, 80)}`);
+  }
+  console.log(`[OHLCV-D] Gate.io fallback...`);
+  return await _fetchGateKlines(symbol, '1d', limit);
 }
 
 /** Bybit Futures kline — прямой HTTP без CCXT */
@@ -60,9 +84,9 @@ function _fetchBybitKlines(symbol, interval, limit) {
 
 /** Binance USDM Futures kline — фолбэк #1 */
 function _fetchBinanceKlines(symbol, interval, limit) {
-  // SOL/USDT:USDT → SOLUSDT, 15 → 15m
+  // SOL/USDT:USDT → SOLUSDT. interval передаётся как есть: '15m', '1d' и т.д.
   const sym  = symbol.replace('/', '').replace(':USDT', '');
-  const path = `/fapi/v1/klines?symbol=${sym}&interval=${interval}m&limit=${limit}`;
+  const path = `/fapi/v1/klines?symbol=${sym}&interval=${interval}&limit=${limit}`;
   return _httpsGet('fapi.binance.com', path).then(raw => {
     const arr = JSON.parse(raw);
     if (!Array.isArray(arr)) throw new Error(`Binance blocked: ${raw.slice(0, 120)}`);
@@ -76,9 +100,9 @@ function _fetchBinanceKlines(symbol, interval, limit) {
 
 /** Gate.io USDT Futures kline — фолбэк #2 (нет US блокировок) */
 function _fetchGateKlines(symbol, interval, limit) {
-  // SOL/USDT:USDT → SOL_USDT, 15 → 15m
+  // SOL/USDT:USDT → SOL_USDT. interval как есть: '15m', '1d' и т.д.
   const sym  = symbol.split('/')[0] + '_USDT';
-  const path = `/api/v4/futures/usdt/candlesticks?contract=${sym}&interval=${interval}m&limit=${limit}`;
+  const path = `/api/v4/futures/usdt/candlesticks?contract=${sym}&interval=${interval}&limit=${limit}`;
   return _httpsGet('api.gateio.ws', path).then(raw => {
     const arr = JSON.parse(raw);
     if (!Array.isArray(arr)) throw new Error(`Gate.io: ${raw.slice(0, 120)}`);

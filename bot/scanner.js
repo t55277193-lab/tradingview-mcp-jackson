@@ -8,9 +8,11 @@
  *   4. Логирует сделку в Notion
  */
 
-import { analyzeCandles, inKillZone } from './signals.js';
-import { openPosition, getPositions, fetchPublicOHLCV } from './bybit.js';
-import { logTradeOpen }                from './notion.js';
+import { analyzeCandles, inKillZone }                          from './signals.js';
+import { openPosition, getPositions,
+         fetchPublicOHLCV, fetchPublicDailyOHLCV }             from './bybit.js';
+import { logTradeOpen }                                        from './notion.js';
+import { analyzeMarkov, markovLabel, MARKOV_PARAMS }           from './markov.js';
 
 // ══════════ Символы для торговли ══════════
 const SYMBOLS = [
@@ -31,9 +33,9 @@ function getState(symbol) {
   return symbolStates[symbol];
 }
 
-// ══════════ Загрузка свечей с Bybit (прямой HTTP) ══════════
+// ══════════ Загрузка 15-минутных свечей ══════════
 async function fetchClosedCandles(symbol, limit = 110) {
-  const candles = await fetchPublicOHLCV(symbol, '15', limit);
+  const candles = await fetchPublicOHLCV(symbol, limit);
   // Убираем последнюю свечу — она ещё не закрыта
   return candles.slice(0, -1);
 }
@@ -51,7 +53,18 @@ async function scanSymbol(symbol) {
       return log;
     }
 
-    // Проверяем открытые позиции (fail-safe: если API недоступно — считаем нет позиций)
+    // ── Markov Regime Model (дневной макро-фильтр) ──────────────────────────
+    let markov = null;
+    try {
+      const dailyCandles = await fetchPublicDailyOHLCV(symbol, 220);
+      if (dailyCandles.length >= MARKOV_PARAMS.minHistory) {
+        markov = analyzeMarkov(dailyCandles);
+      }
+    } catch (e) {
+      console.log(`[Scanner] ⚠️  Markov: ${e.message.slice(0, 60)}`);
+    }
+
+    // ── Открытые позиции (fail-safe) ────────────────────────────────────────
     let positions = [];
     try {
       positions = await getPositions();
@@ -61,19 +74,19 @@ async function scanSymbol(symbol) {
     const hasPosition = positions.some(p => p.symbol === symbol);
     state.openPosition = hasPosition;
 
-    // Анализ
+    // ── SMC анализ 15-минутных свечей ────────────────────────────────────────
     const { signal, debug, reason } = analyzeCandles(candles, state);
 
-    // Красивый лог состояния
-    const lastCandle = candles[candles.length - 1];
+    // ── Лог состояния ────────────────────────────────────────────────────────
     const kzMark  = debug?.kz       ? '🟢KZ' : '⚫KZ';
     const adxMark = debug?.trendOK  ? `🟢ADX${debug.adx}` : `🔴ADX${debug.adx}`;
     const stMark  = debug?.stDir    || '?';
     const emaMark = debug?.aboveEMA ? '↑EMA' : '↓EMA';
     const volMark = debug?.volOK    ? '🟢Vol' : '🔴Vol';
+    const mkvMark = markov          ? markovLabel(markov) : '?MKV';
     const posMark = hasPosition     ? '📌POS' : '';
 
-    console.log(`[Scanner] ${symbol.split('/')[0].padEnd(5)} | ${kzMark} ${adxMark} ${stMark} ${emaMark} ${volMark} ${posMark}`.trimEnd());
+    console.log(`[Scanner] ${symbol.split('/')[0].padEnd(5)} | ${kzMark} ${adxMark} ${stMark} ${emaMark} ${volMark} | ${mkvMark} ${posMark}`.trimEnd());
 
     if (!signal) {
       log.reason = reason || 'нет сигнала';
@@ -81,6 +94,22 @@ async function scanSymbol(symbol) {
     }
 
     log.signal = signal;
+
+    // ── Markov фильтр сигнала ────────────────────────────────────────────────
+    if (markov && Math.abs(markov.signal) >= MARKOV_PARAMS.filterThresh) {
+      if (signal.action === 'long' && markov.signal < -MARKOV_PARAMS.filterThresh) {
+        const reason = `Markov медвежий режим: ${mkvMark} (${(markov.bullProb*100).toFixed(0)}% bull vs ${(markov.bearProb*100).toFixed(0)}% bear)`;
+        log.reason = reason;
+        console.log(`[Scanner] 🚫 ${symbol.split('/')[0]} LONG заблокирован — ${reason}`);
+        return log;
+      }
+      if (signal.action === 'short' && markov.signal > MARKOV_PARAMS.filterThresh) {
+        const reason = `Markov бычий режим: ${mkvMark} (${(markov.bullProb*100).toFixed(0)}% bull vs ${(markov.bearProb*100).toFixed(0)}% bear)`;
+        log.reason = reason;
+        console.log(`[Scanner] 🚫 ${symbol.split('/')[0]} SHORT заблокирован — ${reason}`);
+        return log;
+      }
+    }
 
     // Проверяем лимит позиций
     const maxPos = parseInt(process.env.MAX_POSITIONS ?? '2');
